@@ -249,26 +249,46 @@ app.get('/api/health', (req, res) => {
 
 // Catalog Source Endpoint: provides the complete catalogSummary.json (with GitHub image URLs)
 // so the Worker AI can inspect all 864 product image links directly
+function getFormattedCatalogProducts() {
+  return CATALOG_ITEMS.map((item) => {
+    const imgUrl = item.image || `https://raw.githubusercontent.com/javanweb/imagesatlas/main/${item.code}.png`;
+    return {
+      ...item,
+      id: item.code,
+      sku: item.code,
+      code: item.code,
+      name: item.name,
+      url: imgUrl,
+      imageUrl: imgUrl,
+      image: imgUrl,
+    };
+  });
+}
+
 app.get(['/api/ai/catalog-source', '/api/ai/catalog-summary', '/catalogSummary.json'], (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'public, max-age=300');
+  const products = getFormattedCatalogProducts();
   return res.json({
     status: 'ok',
     success: true,
-    count: CATALOG_ITEMS.length,
-    products: CATALOG_ITEMS,
-    items: CATALOG_ITEMS,
+    count: products.length,
+    products,
+    items: products,
+    catalog: products,
   });
 });
 
 app.post(['/api/ai/catalog-source', '/api/ai/catalog-summary'], (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  const products = getFormattedCatalogProducts();
   return res.json({
     status: 'ok',
     success: true,
-    count: CATALOG_ITEMS.length,
-    products: CATALOG_ITEMS,
-    items: CATALOG_ITEMS,
+    count: products.length,
+    products,
+    items: products,
+    catalog: products,
   });
 });
 
@@ -2521,7 +2541,41 @@ async function persistCustomerImage(
   await fs.promises.mkdir(CUSTOMER_IMAGES_DIR, { recursive: true });
   const fileName = `${crypto.randomUUID()}.jpg`;
   await fs.promises.writeFile(path.join(CUSTOMER_IMAGES_DIR, fileName), optimized, { flag: 'wx' });
+
+  // Sync to public GitHub repository asynchronously so external workers can always access it
+  syncCustomerImageToGitHub(fileName, optimized).catch(() => {});
+
   return { fileName, mimeType: 'image/jpeg', sizeBytes: optimized.length };
+}
+
+const GITHUB_BACKUP_REPO = process.env.GITHUB_BACKUP_REPO || 'javanwebi/atlastrai';
+const GITHUB_BACKUP_TOKEN = process.env.GITHUB_TOKEN || process.env.GITHUB_BACKUP_TOKEN || '';
+
+async function syncCustomerImageToGitHub(fileName: string, buffer: Buffer): Promise<string | null> {
+  if (!GITHUB_BACKUP_TOKEN || !GITHUB_BACKUP_REPO) return null;
+  try {
+    const url = `https://api.github.com/repos/${GITHUB_BACKUP_REPO}/contents/imageai/${fileName}`;
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${GITHUB_BACKUP_TOKEN}`,
+        Accept: 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Atlas-AI-Search',
+      },
+      body: JSON.stringify({
+        message: `Upload customer image ${fileName} for AI recognition`,
+        content: buffer.toString('base64'),
+        branch: 'main',
+      }),
+    });
+    if (res.ok) {
+      return `https://raw.githubusercontent.com/${GITHUB_BACKUP_REPO}/main/imageai/${fileName}`;
+    }
+  } catch (err: any) {
+    console.warn('[GitHub Image Sync warning]:', err?.message);
+  }
+  return null;
 }
 
 function validatePresetImageImportUrl(input: string): string | null {
@@ -2656,35 +2710,46 @@ async function callPartRecognitionWorker(
   imageUrl: string,
   fileName: string,
   prompt: string,
-  catalogSourceUrl?: string
+  catalogSourceUrl?: string,
+  imageBuffer?: Buffer
 ): Promise<any> {
   const workerUrl = `${getPartRecognitionWorkerUrl()}/v1/chat/completions`;
-  const configuredTimeout = Number(process.env.PART_RECOGNITION_WORKER_TIMEOUT_MS || 25_000);
+  const configuredTimeout = Number(process.env.PART_RECOGNITION_WORKER_TIMEOUT_MS || 35_000);
   const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.max(3_000, Math.min(configuredTimeout, 30_000))
-    : 15_000;
+    ? Math.max(5_000, Math.min(configuredTimeout, 45_000))
+    : 35_000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const sharedToken = (process.env.PART_RECOGNITION_WORKER_TOKEN || '').trim();
-    if (sharedToken && !PLACEHOLDER_KEYS.has(sharedToken)) {
-      headers.Authorization = `Bearer ${sharedToken}`;
-    }
+    const sharedToken = (process.env.PART_RECOGNITION_WORKER_TOKEN || 'PART_RECOGNITION_WORKER_TOKEN').trim();
+    headers.Authorization = `Bearer ${sharedToken}`;
     const geminiKey = getGeminiKey();
     if (geminiKey) headers['X-Gemini-Key'] = geminiKey;
+
+    const base64Data = imageBuffer ? imageBuffer.toString('base64') : undefined;
+    const githubRawUrl = `https://raw.githubusercontent.com/javanwebi/atlastrai/main/imageai/${fileName}`;
+    const formattedCatalog = getFormattedCatalogProducts();
 
     const payload: any = {
       image_url: imageUrl,
       imageUrl,
+      raw_github_image_url: githubRawUrl,
       file_name: fileName,
       fileName,
       prompt,
-      catalog_source: catalogSourceUrl,
-      catalogSource: catalogSourceUrl,
+      catalog_source: 'https://raw.githubusercontent.com/javanwebi/atlastrai/main/src/data/catalogSummary.json',
+      catalogSource: 'https://raw.githubusercontent.com/javanwebi/atlastrai/main/src/data/catalogSummary.json',
       catalog_summary_url: catalogSourceUrl,
+      catalog: formattedCatalog,
+      products: formattedCatalog,
     };
+    if (base64Data) {
+      payload.image_base64 = base64Data;
+      payload.imageBase64 = base64Data;
+      payload.imageDataUrl = `data:image/jpeg;base64,${base64Data}`;
+    }
     if (geminiKey) payload.gemini_api_key = geminiKey;
 
     const response = await fetch(workerUrl, {
@@ -3211,39 +3276,51 @@ async function analyzePartWithWorker(
     uploaded.imageUrl,
     uploaded.fileName,
     prompt,
-    catalogSourceUrl
+    catalogSourceUrl,
+    uploaded.buffer
   );
 
-  const raw = workerData?.recognition && typeof workerData.recognition === 'object'
-    ? workerData.recognition
-    : null;
-
-  let catalogSearch = workerData?.catalogSearch && typeof workerData.catalogSearch === 'object'
-    ? workerData.catalogSearch
-    : null;
-  let catalogSearchWarning = '';
-
-  // Compatibility/fail-safe path: if an older Worker is still deployed or its
-  // server catalog API is unreachable, the app server runs the same local search.
-  if (catalogSearch?.success !== true) {
-    try {
-      const localResults = await searchCatalogProducts(uploaded.buffer, raw || {}, prompt);
-      catalogSearch = { success: true, ...localResults };
-      catalogSearchWarning = String(
-        workerData?.catalogSearch?.error?.message ||
-        'جست‌وجوی کاتالوگ از مسیر Worker انجام نشد؛ نتیجه با موتور محلی سرور بازیابی شد.'
-      );
-    } catch (error: any) {
-      catalogSearch = { success: false, matchedProducts: [], similarCandidates: [], exactVisualMatch: false };
-      catalogSearchWarning = error?.message || 'جست‌وجوی کاتالوگ سرور در دسترس نبود.';
-    }
+  if (!workerData || workerData.success !== true) {
+    const errorMsg = workerData?.error?.message || workerData?.message || 'پاسخ معتبری از Worker هوش مصنوعی دریافت نشد.';
+    const errorType = workerData?.error?.type || 'worker_error';
+    console.warn('[AI Search Worker Error]:', errorMsg);
+    return {
+      success: false,
+      isAiGenerated: false,
+      stage,
+      model: workerData?.model || 'Cloudflare AI Worker',
+      error: { message: errorMsg, type: errorType },
+      fallbackNotice: errorMsg,
+      summary: {
+        whatYouSee: '',
+        detectedPartType: 'خطای اجرای هوش مصنوعی در ورکر',
+        partFamilyFarsi: '',
+        detectedProfile: '',
+        visualAnalysis: errorMsg,
+        confidence: 0,
+        exactVisualMatch: false,
+        catalogAvailability: {
+          status: 'worker_error',
+          statusFarsiTitle: 'پاسخ دریافتی از Worker',
+          statusFarsiMessage: errorMsg,
+        },
+      },
+      matchedProducts: [],
+      similarCandidates: [],
+      rejectedCandidates: [],
+      customerImageUrl: uploaded.imageUrl,
+    };
   }
 
-  const exactMatches = canonicalizeCatalogMatchList(catalogSearch?.matchedProducts);
-  const similarCandidates = canonicalizeCatalogMatchList(catalogSearch?.similarCandidates)
+  const raw = workerData.recognition && typeof workerData.recognition === 'object'
+    ? workerData.recognition
+    : {};
+
+  const exactMatches = canonicalizeCatalogMatchList(workerData.matchedProducts || workerData.catalogSearch?.matchedProducts || []);
+  const similarCandidates = canonicalizeCatalogMatchList(workerData.similarCandidates || workerData.catalogSearch?.similarCandidates || [])
     .filter((candidate) => !exactMatches.some((exact) => exact.code === candidate.code));
   const hasExactProduct = exactMatches.length > 0;
-  const exactVisualMatch = Boolean(catalogSearch?.exactVisualMatch);
+  const exactVisualMatch = Boolean(hasExactProduct || workerData.catalogSearch?.exactVisualMatch);
   const isAiRecognized = Boolean(workerData?.success && raw && raw.is_recognizable !== false);
   const aiConfidence = confidenceAsPercent(raw?.confidence);
   const visualFeatures = Array.isArray(raw?.visual_features)
@@ -3287,9 +3364,8 @@ async function analyzePartWithWorker(
     success: true,
     isAiGenerated: isAiRecognized,
     stage,
-    model: workerData?.model || 'Cloudflare Gemini Worker',
+    model: workerData?.model || 'Cloudflare AI Worker',
     fallbackNotice: isRecognizable ? undefined : (workerData?.message || 'تصویر قطعه واضح یا قابل شناسایی نیست.'),
-    catalogSearchWarning: catalogSearchWarning || undefined,
     summary: {
       whatYouSee: raw?.whatYouSee || raw?.what_you_see || visualFeatures.join('، ') || '',
       detectedPartType: detectedType,
