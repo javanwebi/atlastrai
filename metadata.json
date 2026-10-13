@@ -1,0 +1,8 @@
+{
+  "name": "Remix صنعت پیش",
+  "description": "A platform for seamless project cloning, repository management, and streamlined development workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
